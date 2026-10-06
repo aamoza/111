@@ -1,7 +1,5 @@
 /**
  * Ad & Tracker Detector and Stripper.
- * Identifies invasive ad SDKs, analytics trackers, and advertising permissions,
- * allowing one-click removal and hardening of the APK manifest.
  */
 
 export interface DetectedTracker {
@@ -85,9 +83,6 @@ const KNOWN_TRACKERS = [
   },
 ];
 
-/**
- * Scans the manifest XML text and components to detect active trackers and ad SDKs
- */
 export function detectTrackers(rawXmlText: string, permissions: string[]): DetectedTracker[] {
   const detected: DetectedTracker[] = [];
   const textLower = rawXmlText.toLowerCase();
@@ -100,7 +95,6 @@ export function detectTrackers(rawXmlText: string, permissions: string[]): Detec
       }
     }
 
-    // Check permissions
     if (tracker.id === 'google-admob' && permissions.includes('com.google.android.gms.permission.AD_ID')) {
       if (!matches.includes('AD_ID')) matches.push('AD_ID (دسترسی شناسه تبلیغاتی)');
     }
@@ -117,36 +111,45 @@ export function detectTrackers(rawXmlText: string, permissions: string[]): Detec
 }
 
 /**
- * Strips ad trackers, activities, and advertising ID permissions from AndroidManifest.xml
+ * Fully remove ad/tracker components and AD_ID permissions.
+ * Clean XML only (no comment placeholders) so Binary AXML re-encode stays valid.
  */
 export function stripTrackersFromXml(rawXmlText: string): { cleanedXml: string; removedItemsCount: number } {
   let cleaned = rawXmlText;
   let removedItemsCount = 0;
 
-  // 1. Remove AD_ID permission
-  const adIdRegex = /<uses-permission[^>]*android:name=["']com\.google\.android\.gms\.permission\.AD_ID["'][^>]*\/>/gi;
-  if (adIdRegex.test(cleaned)) {
-    cleaned = cleaned.replace(adIdRegex, '');
-    removedItemsCount++;
-  }
+  const countAndRemove = (re: RegExp) => {
+    const matches = cleaned.match(re);
+    if (matches && matches.length) {
+      removedItemsCount += matches.length;
+      cleaned = cleaned.replace(re, '');
+    }
+  };
 
-  // 2. Remove common ad and tracking activities / receivers / services
-  const adPatterns = [
-    /<activity[^>]*com\.google\.android\.gms\.ads[^>]*>([\s\S]*?<\/activity>|\/>)/gi,
-    /<activity[^>]*com\.facebook\.ads[^>]*>([\s\S]*?<\/activity>|\/>)/gi,
-    /<activity[^>]*com\.unity3d\.services\.ads[^>]*>([\s\S]*?<\/activity>|\/>)/gi,
-    /<activity[^>]*com\.applovin[^>]*>([\s\S]*?<\/activity>|\/>)/gi,
-    /<receiver[^>]*com\.appsflyer[^>]*>([\s\S]*?<\/receiver>|\/>)/gi,
-    /<receiver[^>]*com\.adjust\.sdk[^>]*>([\s\S]*?<\/receiver>|\/>)/gi,
+  countAndRemove(/\s*<uses-permission[^>]*android:name=["']com\.google\.android\.gms\.permission\.AD_ID["'][^>]*\/>/gi);
+  countAndRemove(/\s*<uses-permission[^>]*android:name=["']android\.permission\.ACCESS_ADSERVICES_AD_ID["'][^>]*\/>/gi);
+  countAndRemove(/\s*<uses-permission[^>]*android:name=["']android\.permission\.ACCESS_ADSERVICES_ATTRIBUTION["'][^>]*\/>/gi);
+
+  const sdkNeedles = [
+    'com\\.google\\.android\\.gms\\.ads',
+    'com\\.google\\.ads',
+    'com\\.facebook\\.ads',
+    'com\\.unity3d\\.(ads|services\\.ads)',
+    'com\\.applovin',
+    'com\\.ironsource',
+    'com\\.supersonicads',
+    'com\\.appsflyer',
+    'com\\.adjust\\.sdk',
+    'com\\.google\\.android\\.gms\\.measurement',
   ];
 
-  for (const pat of adPatterns) {
-    const matches = cleaned.match(pat);
-    if (matches) {
-      removedItemsCount += matches.length;
-      cleaned = cleaned.replace(pat, '<!-- Stripped by APK AI Studio Ad-Remover -->');
-    }
+  for (const needle of sdkNeedles) {
+    countAndRemove(new RegExp(`\\s*<(activity|service|receiver|provider)[^>]*${needle}[^>]*/>`, 'gi'));
+    countAndRemove(
+      new RegExp(`\\s*<(activity|service|receiver|provider)[^>]*${needle}[^>]*>[\\s\\S]*?<\\/\\1>`, 'gi')
+    );
   }
 
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
   return { cleanedXml: cleaned, removedItemsCount };
 }
