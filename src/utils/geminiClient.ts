@@ -1,19 +1,21 @@
 /**
  * Unified Gemini client — model discovery + cache + controlled fallback.
+ * Only text generateContent models (never image/tts-only).
  */
 
 const STORAGE_KEY = 'apkaistudio_gemini_api_key';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
-const MAX_GENERATE_ATTEMPTS = 3;
+const MAX_GENERATE_ATTEMPTS = 4;
 
-/** Preferred order when ranking discovered models (newest flash first). */
-const PREFERRED_NAME_HINTS = [
+/** Preferred text models (newest first). */
+const PREFERRED_TEXT_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-flash-latest',
+  'gemini-1.5-flash-latest',
   'gemini-1.5-flash',
-  'gemini-flash',
+  'gemini-1.5-pro',
   'gemini-pro',
 ];
 
@@ -72,22 +74,36 @@ export function invalidateModelCache(): void {
 
 function classifyApiError(status: number, bodyMsg: string): string {
   const lower = (bodyMsg || '').toLowerCase();
-  if (status === 401 || status === 400 || /api.?key|invalid|permission denied|unauthenticated/i.test(lower)) {
+  if (status === 401 || /api.?key|invalid.?key|permission denied|unauthenticated|api_key_invalid/i.test(lower)) {
     return 'کلید API نامعتبر است یا دسترسی ندارد.';
+  }
+  if (status === 400 && /api.?key/i.test(lower)) {
+    return 'کلید API نامعتبر است یا دسترسی ندارد.';
+  }
+  if (status === 429 || /resource.?exhausted|rate.?limit|quota/i.test(lower)) {
+    return 'محدودیت نرخ یا quota. کمی بعد دوباره تلاش کنید.';
   }
   if (status === 403 && /quota|rate|limit|resource.?exhausted/i.test(lower)) {
     return 'سقف استفاده (quota) یا محدودیت نرخ درخواست.';
   }
-  if (status === 429 || /quota|rate.?limit|resource.?exhausted/i.test(lower)) {
-    return 'محدودیت نرخ یا quota. کمی بعد دوباره تلاش کنید.';
+  if (status === 404 || /not found|is not found|not supported/i.test(lower)) {
+    return 'مدل در دسترس نیست یا برای متن مناسب نیست.';
   }
-  if (status === 404 || /not found|is not found/i.test(lower)) {
-    return 'مدل در دسترس نیست.';
-  }
-  if (!status || /failed to fetch|network|offline/i.test(lower)) {
+  if (!status || /failed to fetch|network|offline|load failed/i.test(lower)) {
     return 'خطای شبکه یا قطع اینترنت.';
   }
   return bodyMsg || `خطای API (${status})`;
+}
+
+/** Models that must never be used for text chat/commands. */
+function isNonTextModel(name: string): boolean {
+  const n = name.toLowerCase();
+  return (
+    /embedding|aqa|gecko|imagen|image|tts|audio|speech|veo|live|robotics|computer.?use/i.test(n) ||
+    n.endsWith('-image') ||
+    n.includes('flash-image') ||
+    n.includes('image-generation')
+  );
 }
 
 interface ListedModel {
@@ -115,62 +131,88 @@ function rankModels(models: ListedModel[]): string[] {
   const usable = models.filter(
     (m) =>
       m.name &&
-      m.supportedMethods.includes('generateContent') &&
-      !/embedding|aqa|gecko|vision-only/i.test(m.name)
+      !isNonTextModel(m.name) &&
+      (m.supportedMethods.length === 0 || m.supportedMethods.includes('generateContent'))
   );
 
   const scored = usable.map((m) => {
     let score = 0;
     const n = m.name.toLowerCase();
-    PREFERRED_NAME_HINTS.forEach((hint, i) => {
-      if (n.includes(hint.replace('gemini-', ''))) score += 100 - i * 10;
+
+    // Exact / prefix preference for known text flash models
+    PREFERRED_TEXT_MODELS.forEach((pref, i) => {
+      if (n === pref) score += 200 - i * 5;
+      else if (n.startsWith(pref + '-') && !isNonTextModel(n)) score += 150 - i * 5;
+      else if (n.includes(pref)) score += 80 - i * 3;
     });
-    if (n.includes('flash')) score += 20;
-    if (n.includes('latest')) score += 15;
-    if (n.includes('2.5')) score += 30;
-    if (n.includes('2.0')) score += 25;
-    if (n.includes('pro') && !n.includes('flash')) score += 5;
-    if (n.includes('exp') || n.includes('preview')) score -= 5;
+
+    if (n === 'gemini-2.5-flash' || n.startsWith('gemini-2.5-flash-')) {
+      // only plain 2.5-flash family without image
+      if (!isNonTextModel(n)) score += 50;
+    }
+    if (n.includes('flash') && !isNonTextModel(n)) score += 25;
+    if (n.includes('latest')) score += 20;
+    if (n.includes('2.5') && !isNonTextModel(n)) score += 35;
+    if (n.includes('2.0') && !isNonTextModel(n)) score += 28;
+    if (n.includes('1.5') && !isNonTextModel(n)) score += 15;
+    if (n.includes('pro') && !n.includes('flash')) score += 8;
+    if (n.includes('exp') || n.includes('preview') || n.includes('thinking')) score -= 8;
+
+    // Hard penalty if somehow slipped through
+    if (isNonTextModel(n)) score -= 1000;
+
     return { name: m.name, score };
   });
 
   scored.sort((a, b) => b.score - a.score);
-  const names = scored.map((s) => s.name);
-  // Ensure common aliases tried if present in list
-  for (const alias of ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
-    if (names.includes(alias) && names[0] !== alias) {
-      // already ranked
-    }
+  const names = scored.filter((s) => s.score > -100).map((s) => s.name);
+
+  // Always append safe aliases so we can fallback even if list is weird
+  const fallbacks = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-flash-latest',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+  ];
+  const merged = [...names];
+  for (const f of fallbacks) {
+    if (!merged.includes(f)) merged.push(f);
   }
-  return names.length ? names : ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  return merged.length ? merged : fallbacks;
 }
 
-/**
- * Resolve best available Gemini model for generateContent.
- * Caches result with TTL; invalidate on failure.
- */
 export async function resolveBestGeminiModel(apiKey?: string): Promise<{ model: string; candidates: string[] }> {
   const key = apiKey || getStoredApiKey();
   if (!key) throw new Error('کلید Gemini یافت نشد. از تنظیمات کلید را وارد کنید.');
 
   const fp = fingerprintKey(key);
   if (modelCache && modelCache.apiKeyFingerprint === fp && Date.now() < modelCache.expiresAt) {
-    return { model: modelCache.model, candidates: modelCache.candidates };
+    // Never serve a cached non-text model
+    if (!isNonTextModel(modelCache.model)) {
+      return { model: modelCache.model, candidates: modelCache.candidates.filter((c) => !isNonTextModel(c)) };
+    }
+    invalidateModelCache();
   }
 
   let candidates: string[];
   try {
     const listed = await listModels(key);
-    candidates = rankModels(listed);
+    candidates = rankModels(listed).filter((c) => !isNonTextModel(c));
   } catch (e) {
-    // Discovery failed — still try known aliases (not infinite)
-    candidates = ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro'];
+    candidates = [
+      'gemini-2.5-flash',
+      'gemini-2.0-flash',
+      'gemini-flash-latest',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro',
+    ];
     const msg = e instanceof Error ? e.message : String(e);
     if (/کلید API نامعتبر|دسترسی ندارد/.test(msg)) throw e;
   }
 
   if (!candidates.length) {
-    throw new Error('هیچ مدل Gemini با قابلیت generateContent در دسترس نیست.');
+    throw new Error('هیچ مدل متنی Gemini با generateContent در دسترس نیست.');
   }
 
   modelCache = {
@@ -182,54 +224,84 @@ export async function resolveBestGeminiModel(apiKey?: string): Promise<{ model: 
   return { model: candidates[0], candidates };
 }
 
+async function pingModel(apiKey: string, model: string): Promise<{ ok: boolean; status: number; raw: string }> {
+  const url = `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: 'Reply with one word: ok' }] }],
+      generationConfig: { maxOutputTokens: 16, temperature: 0 },
+    }),
+  });
+  if (res.ok) return { ok: true, status: res.status, raw: '' };
+  const errBody = await res.json().catch(() => ({}));
+  const raw = errBody?.error?.message || '';
+  return { ok: false, status: res.status, raw };
+}
+
 export async function checkGeminiStatus(): Promise<GeminiStatus> {
   const userKey = getStoredApiKey();
 
   if (userKey) {
     try {
-      const { model, candidates } = await resolveBestGeminiModel(userKey);
-      // Ping resolved model
-      const url = `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(userKey)}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: 'پینگ. فقط یک کلمه: متصل' }] }],
-          generationConfig: { maxOutputTokens: 16, temperature: 0 },
-        }),
-      });
+      const { candidates } = await resolveBestGeminiModel(userKey);
+      let lastClassified = '';
+      let lastModel = candidates[0];
 
-      if (res.ok) {
-        return {
-          configured: true,
-          connected: true,
-          message: `اتصال برقرار است. مدل: ${model}`,
-          model,
-          source: 'user-key',
-        };
+      // Try up to MAX candidates until one pings OK
+      for (const model of candidates.slice(0, MAX_GENERATE_ATTEMPTS)) {
+        if (isNonTextModel(model)) continue;
+        lastModel = model;
+        try {
+          const ping = await pingModel(userKey, model);
+          if (ping.ok) {
+            modelCache = {
+              model,
+              candidates: [model, ...candidates.filter((c) => c !== model && !isNonTextModel(c))],
+              expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+              apiKeyFingerprint: fingerprintKey(userKey),
+            };
+            return {
+              configured: true,
+              connected: true,
+              message: `اتصال برقرار است. مدل: ${model}`,
+              model,
+              source: 'user-key',
+            };
+          }
+          lastClassified = classifyApiError(ping.status, ping.raw);
+          // Invalid key → stop immediately
+          if (/کلید API نامعتبر/.test(lastClassified)) {
+            return {
+              configured: true,
+              connected: false,
+              message: lastClassified,
+              model,
+              source: 'user-key',
+            };
+          }
+          // Wrong model / not found → try next
+          continue;
+        } catch (e) {
+          lastClassified = e instanceof Error ? e.message : String(e);
+          if (/شبکه|اینترنت|failed to fetch/i.test(lastClassified)) {
+            return {
+              configured: true,
+              connected: false,
+              message: 'خطای شبکه یا قطع اینترنت.',
+              source: 'user-key',
+            };
+          }
+        }
       }
 
-      const errBody = await res.json().catch(() => ({}));
-      const raw = errBody?.error?.message || '';
-      const classified = classifyApiError(res.status, raw);
-
-      // Try next candidate once
-      if (candidates.length > 1 && /مدل|not found|404/i.test(classified + raw)) {
-        invalidateModelCache();
-        modelCache = {
-          model: candidates[1],
-          candidates: candidates.slice(1),
-          expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
-          apiKeyFingerprint: fingerprintKey(userKey),
-        };
-        return checkGeminiStatus();
-      }
-
+      invalidateModelCache();
       return {
         configured: true,
         connected: false,
-        message: classified,
-        model,
+        message: lastClassified || 'هیچ مدل متنی پاسخ نداد. کلید یا سهمیه را بررسی کنید.',
+        model: lastModel,
         source: 'user-key',
       };
     } catch (e) {
@@ -251,7 +323,7 @@ export async function checkGeminiStatus(): Promise<GeminiStatus> {
         configured: !!data.configured,
         connected: !!data.connected,
         message: data.model
-          ? `${data.message || (data.connected ? 'متصل' : 'قطع')} · مدل: ${data.model}`
+          ? `${data.message || (data.connected ? 'متصل' : 'قطع')}`
           : data.message || (data.connected ? 'متصل' : 'قطع'),
         model: data.model,
         source: data.configured ? 'server' : 'none',
@@ -310,7 +382,7 @@ async function generateWithUserKey(apiKey: string, options: GenerateOptions): Pr
     (bodyBase.generationConfig as Record<string, unknown>).responseMimeType = options.responseMimeType;
   }
 
-  const tryList = candidates.slice(0, MAX_GENERATE_ATTEMPTS);
+  const tryList = candidates.filter((c) => !isNonTextModel(c)).slice(0, MAX_GENERATE_ATTEMPTS);
   for (let i = 0; i < tryList.length; i++) {
     const model = tryList[i];
     const url = `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -325,13 +397,9 @@ async function generateWithUserKey(apiKey: string, options: GenerateOptions): Pr
         const errBody = await res.json().catch(() => ({}));
         const raw = errBody?.error?.message || '';
         lastError = classifyApiError(res.status, raw);
-        if (/مدل|not found|404/i.test(lastError + raw) || res.status === 404) {
-          invalidateModelCache();
-          continue;
-        }
-        if (/کلید API نامعتبر|quota|محدودیت نرخ/i.test(lastError)) {
-          throw new Error(lastError);
-        }
+        if (/کلید API نامعتبر/.test(lastError)) throw new Error(lastError);
+        // try next model for not found / wrong type / even quota on one model
+        invalidateModelCache();
         continue;
       }
 
@@ -346,21 +414,20 @@ async function generateWithUserKey(apiKey: string, options: GenerateOptions): Pr
         continue;
       }
 
-      // Promote successful model to cache head
       modelCache = {
         model,
-        candidates: [model, ...candidates.filter((c) => c !== model)],
+        candidates: [model, ...candidates.filter((c) => c !== model && !isNonTextModel(c))],
         expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
         apiKeyFingerprint: fingerprintKey(apiKey),
       };
       return text;
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
-      if (/کلید API نامعتبر|قطع اینترنت|شبکه|quota/i.test(lastError)) throw e;
+      if (/کلید API نامعتبر|قطع اینترنت|شبکه/i.test(lastError)) throw e;
     }
   }
 
-  throw new Error(lastError || 'هیچ مدل Gemini پاسخ نداد.');
+  throw new Error(lastError || 'هیچ مدل متنی Gemini پاسخ نداد.');
 }
 
 const ASSISTANT_SYSTEM = `تو دستیار ارشد APK AI Studio هستی: مهندس اندروید، تحلیل‌گر امنیت و مشاور بهینه‌سازی اپ.
@@ -493,5 +560,5 @@ export async function geminiAnalyze(type: string, context: unknown, prompt?: str
   return data.text || 'پاسخی دریافت نشد.';
 }
 
-/** @deprecated use resolveBestGeminiModel — kept for imports */
-export const LATEST_MODEL = 'gemini-flash-latest';
+/** Display hint only — real model comes from resolveBestGeminiModel */
+export const LATEST_MODEL = 'auto (text flash)';

@@ -20,7 +20,7 @@ import {
   getStoredApiKey,
   setStoredApiKey,
   clearStoredApiKey,
-  LATEST_MODEL,
+  invalidateModelCache,
   type GeminiStatus,
 } from '../utils/geminiClient';
 
@@ -61,6 +61,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const runStatusCheck = async () => {
     setTestingConnection(true);
     try {
+      invalidateModelCache();
       const status = await checkGeminiStatus();
       setConnectionStatus(status);
     } catch (err: unknown) {
@@ -180,9 +181,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <Sparkles className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-sm font-semibold text-white">وضعیت اتصال به آخرین مدل Gemini</h3>
+              <h3 className="text-sm font-semibold text-white">وضعیت اتصال Gemini</h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                همیشه به مدل <span className="font-mono text-emerald-400">{LATEST_MODEL}</span> متصل می‌شود.
+                خودکار بهترین مدل <span className="text-emerald-400">متنی Flash</span> در دسترس را پیدا می‌کند
+                (مدل‌های image حذف می‌شوند).
               </p>
             </div>
           </div>
@@ -239,7 +241,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
             {connectionStatus.source && (
               <p className="text-[11px] text-slate-600 mt-0.5">
-                منبع: {connectionStatus.source === 'user-key' ? 'کلید شخصی شما' : connectionStatus.source === 'server' ? 'سرور' : '—'}
+                منبع:{' '}
+                {connectionStatus.source === 'user-key'
+                  ? 'کلید شخصی شما'
+                  : connectionStatus.source === 'server'
+                    ? 'سرور'
+                    : '—'}
               </p>
             )}
           </div>
@@ -301,13 +308,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             نام برنامه: <span className="text-white font-sans font-bold">APK AI Studio</span>
           </div>
           <div>
-            نسخه: <span className="text-white">1.1.0</span>
+            نسخه: <span className="text-white">1.3.0</span>
           </div>
           <div>
             Package: <span className="text-white">com.apkaistudio.app</span>
           </div>
           <div>
-            مدل AI: <span className="text-emerald-400">{LATEST_MODEL}</span>
+            مدل AI:{' '}
+            <span className="text-emerald-400">
+              {connectionStatus.model || 'auto text-flash'}
+            </span>
           </div>
         </div>
         <p className="text-slate-500 pt-2">
