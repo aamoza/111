@@ -1,12 +1,21 @@
 /**
- * Unified Gemini client for APK AI Studio.
- * - Uses the user's personal API key (localStorage) when available
- * - Always targets the latest Gemini model only
+ * Unified Gemini client — model discovery + cache + controlled fallback.
  */
 
 const STORAGE_KEY = 'apkaistudio_gemini_api_key';
-const LATEST_MODEL = 'gemini-flash-latest';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_GENERATE_ATTEMPTS = 3;
+
+/** Preferred order when ranking discovered models (newest flash first). */
+const PREFERRED_NAME_HINTS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-flash-latest',
+  'gemini-1.5-flash',
+  'gemini-flash',
+  'gemini-pro',
+];
 
 export function getStoredApiKey(): string {
   try {
@@ -21,6 +30,7 @@ export function setStoredApiKey(key: string): void {
     const cleaned = key.trim();
     if (cleaned) localStorage.setItem(STORAGE_KEY, cleaned);
     else localStorage.removeItem(STORAGE_KEY);
+    invalidateModelCache();
   } catch {
     // ignore
   }
@@ -29,6 +39,7 @@ export function setStoredApiKey(key: string): void {
 export function clearStoredApiKey(): void {
   try {
     localStorage.removeItem(STORAGE_KEY);
+    invalidateModelCache();
   } catch {
     // ignore
   }
@@ -42,12 +53,143 @@ export interface GeminiStatus {
   source?: 'user-key' | 'server' | 'none';
 }
 
+interface ModelCache {
+  model: string;
+  candidates: string[];
+  expiresAt: number;
+  apiKeyFingerprint: string;
+}
+
+let modelCache: ModelCache | null = null;
+
+function fingerprintKey(key: string): string {
+  return key.slice(0, 8) + ':' + key.length;
+}
+
+export function invalidateModelCache(): void {
+  modelCache = null;
+}
+
+function classifyApiError(status: number, bodyMsg: string): string {
+  const lower = (bodyMsg || '').toLowerCase();
+  if (status === 401 || status === 400 || /api.?key|invalid|permission denied|unauthenticated/i.test(lower)) {
+    return 'کلید API نامعتبر است یا دسترسی ندارد.';
+  }
+  if (status === 403 && /quota|rate|limit|resource.?exhausted/i.test(lower)) {
+    return 'سقف استفاده (quota) یا محدودیت نرخ درخواست.';
+  }
+  if (status === 429 || /quota|rate.?limit|resource.?exhausted/i.test(lower)) {
+    return 'محدودیت نرخ یا quota. کمی بعد دوباره تلاش کنید.';
+  }
+  if (status === 404 || /not found|is not found/i.test(lower)) {
+    return 'مدل در دسترس نیست.';
+  }
+  if (!status || /failed to fetch|network|offline/i.test(lower)) {
+    return 'خطای شبکه یا قطع اینترنت.';
+  }
+  return bodyMsg || `خطای API (${status})`;
+}
+
+interface ListedModel {
+  name: string;
+  supportedMethods: string[];
+}
+
+async function listModels(apiKey: string): Promise<ListedModel[]> {
+  const url = `${GEMINI_BASE}/models?key=${encodeURIComponent(apiKey)}&pageSize=100`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    const raw = errBody?.error?.message || '';
+    throw new Error(classifyApiError(res.status, raw));
+  }
+  const data = await res.json();
+  const models = Array.isArray(data.models) ? data.models : [];
+  return models.map((m: { name?: string; supportedGenerationMethods?: string[] }) => ({
+    name: (m.name || '').replace(/^models\//, ''),
+    supportedMethods: m.supportedGenerationMethods || [],
+  }));
+}
+
+function rankModels(models: ListedModel[]): string[] {
+  const usable = models.filter(
+    (m) =>
+      m.name &&
+      m.supportedMethods.includes('generateContent') &&
+      !/embedding|aqa|gecko|vision-only/i.test(m.name)
+  );
+
+  const scored = usable.map((m) => {
+    let score = 0;
+    const n = m.name.toLowerCase();
+    PREFERRED_NAME_HINTS.forEach((hint, i) => {
+      if (n.includes(hint.replace('gemini-', ''))) score += 100 - i * 10;
+    });
+    if (n.includes('flash')) score += 20;
+    if (n.includes('latest')) score += 15;
+    if (n.includes('2.5')) score += 30;
+    if (n.includes('2.0')) score += 25;
+    if (n.includes('pro') && !n.includes('flash')) score += 5;
+    if (n.includes('exp') || n.includes('preview')) score -= 5;
+    return { name: m.name, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const names = scored.map((s) => s.name);
+  // Ensure common aliases tried if present in list
+  for (const alias of ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
+    if (names.includes(alias) && names[0] !== alias) {
+      // already ranked
+    }
+  }
+  return names.length ? names : ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+}
+
+/**
+ * Resolve best available Gemini model for generateContent.
+ * Caches result with TTL; invalidate on failure.
+ */
+export async function resolveBestGeminiModel(apiKey?: string): Promise<{ model: string; candidates: string[] }> {
+  const key = apiKey || getStoredApiKey();
+  if (!key) throw new Error('کلید Gemini یافت نشد. از تنظیمات کلید را وارد کنید.');
+
+  const fp = fingerprintKey(key);
+  if (modelCache && modelCache.apiKeyFingerprint === fp && Date.now() < modelCache.expiresAt) {
+    return { model: modelCache.model, candidates: modelCache.candidates };
+  }
+
+  let candidates: string[];
+  try {
+    const listed = await listModels(key);
+    candidates = rankModels(listed);
+  } catch (e) {
+    // Discovery failed — still try known aliases (not infinite)
+    candidates = ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro'];
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/کلید API نامعتبر|دسترسی ندارد/.test(msg)) throw e;
+  }
+
+  if (!candidates.length) {
+    throw new Error('هیچ مدل Gemini با قابلیت generateContent در دسترس نیست.');
+  }
+
+  modelCache = {
+    model: candidates[0],
+    candidates,
+    expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+    apiKeyFingerprint: fp,
+  };
+  return { model: candidates[0], candidates };
+}
+
 export async function checkGeminiStatus(): Promise<GeminiStatus> {
   const userKey = getStoredApiKey();
 
   if (userKey) {
     try {
-      const url = `${GEMINI_BASE}/models/${LATEST_MODEL}:generateContent?key=${encodeURIComponent(userKey)}`;
+      const { model, candidates } = await resolveBestGeminiModel(userKey);
+      // Ping resolved model
+      const url = `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(userKey)}`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -61,26 +203,33 @@ export async function checkGeminiStatus(): Promise<GeminiStatus> {
         return {
           configured: true,
           connected: true,
-          message: 'اتصال با کلید شخصی شما به آخرین مدل Gemini برقرار شد.',
-          model: LATEST_MODEL,
+          message: `اتصال برقرار است. مدل: ${model}`,
+          model,
           source: 'user-key',
         };
       }
 
       const errBody = await res.json().catch(() => ({}));
-      const errMsg =
-        errBody?.error?.message ||
-        (res.status === 400
-          ? 'کلید نامعتبر است.'
-          : res.status === 403
-            ? 'کلید رد شد یا دسترسی ندارد.'
-            : `خطای API: ${res.status}`);
+      const raw = errBody?.error?.message || '';
+      const classified = classifyApiError(res.status, raw);
+
+      // Try next candidate once
+      if (candidates.length > 1 && /مدل|not found|404/i.test(classified + raw)) {
+        invalidateModelCache();
+        modelCache = {
+          model: candidates[1],
+          candidates: candidates.slice(1),
+          expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+          apiKeyFingerprint: fingerprintKey(userKey),
+        };
+        return checkGeminiStatus();
+      }
 
       return {
         configured: true,
         connected: false,
-        message: errMsg,
-        model: LATEST_MODEL,
+        message: classified,
+        model,
         source: 'user-key',
       };
     } catch (e) {
@@ -88,8 +237,7 @@ export async function checkGeminiStatus(): Promise<GeminiStatus> {
       return {
         configured: true,
         connected: false,
-        message: `عدم دسترسی به Gemini: ${msg}`,
-        model: LATEST_MODEL,
+        message: msg,
         source: 'user-key',
       };
     }
@@ -102,8 +250,10 @@ export async function checkGeminiStatus(): Promise<GeminiStatus> {
       return {
         configured: !!data.configured,
         connected: !!data.connected,
-        message: data.message || (data.connected ? 'متصل' : 'قطع'),
-        model: data.model || LATEST_MODEL,
+        message: data.model
+          ? `${data.message || (data.connected ? 'متصل' : 'قطع')} · مدل: ${data.model}`
+          : data.message || (data.connected ? 'متصل' : 'قطع'),
+        model: data.model,
         source: data.configured ? 'server' : 'none',
       };
     }
@@ -136,7 +286,8 @@ export async function generateContent(options: GenerateOptions): Promise<string>
 }
 
 async function generateWithUserKey(apiKey: string, options: GenerateOptions): Promise<string> {
-  const url = `${GEMINI_BASE}/models/${LATEST_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const { candidates } = await resolveBestGeminiModel(apiKey);
+  let lastError = '';
 
   let contents: Array<{ role: string; parts: Array<{ text: string }> }>;
   if (typeof options.contents === 'string') {
@@ -145,59 +296,82 @@ async function generateWithUserKey(apiKey: string, options: GenerateOptions): Pr
     contents = options.contents;
   }
 
-  const body: Record<string, unknown> = {
+  const bodyBase: Record<string, unknown> = {
     contents,
     generationConfig: {
       temperature: options.temperature ?? 0.4,
       maxOutputTokens: options.maxOutputTokens ?? 8192,
     },
   };
-
   if (options.systemInstruction) {
-    body.systemInstruction = { parts: [{ text: options.systemInstruction }] };
+    bodyBase.systemInstruction = { parts: [{ text: options.systemInstruction }] };
   }
-
   if (options.responseMimeType) {
-    (body.generationConfig as Record<string, unknown>).responseMimeType = options.responseMimeType;
+    (bodyBase.generationConfig as Record<string, unknown>).responseMimeType = options.responseMimeType;
   }
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const tryList = candidates.slice(0, MAX_GENERATE_ATTEMPTS);
+  for (let i = 0; i < tryList.length; i++) {
+    const model = tryList[i];
+    const url = `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyBase),
+      });
 
-  if (!res.ok) {
-    const errBody = await res.json().catch(() => ({}));
-    const msg = errBody?.error?.message || `خطای Gemini API (${res.status})`;
-    throw new Error(msg);
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        const raw = errBody?.error?.message || '';
+        lastError = classifyApiError(res.status, raw);
+        if (/مدل|not found|404/i.test(lastError + raw) || res.status === 404) {
+          invalidateModelCache();
+          continue;
+        }
+        if (/کلید API نامعتبر|quota|محدودیت نرخ/i.test(lastError)) {
+          throw new Error(lastError);
+        }
+        continue;
+      }
+
+      const data = await res.json();
+      const text =
+        data?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text || '').join('') ||
+        data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+        '';
+
+      if (!text) {
+        lastError = 'پاسخ خالی از مدل دریافت شد.';
+        continue;
+      }
+
+      // Promote successful model to cache head
+      modelCache = {
+        model,
+        candidates: [model, ...candidates.filter((c) => c !== model)],
+        expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+        apiKeyFingerprint: fingerprintKey(apiKey),
+      };
+      return text;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+      if (/کلید API نامعتبر|قطع اینترنت|شبکه|quota/i.test(lastError)) throw e;
+    }
   }
 
-  const data = await res.json();
-  const text =
-    data?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text || '').join('') ||
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-    '';
-
-  if (!text) throw new Error('پاسخ خالی از مدل دریافت شد.');
-  return text;
+  throw new Error(lastError || 'هیچ مدل Gemini پاسخ نداد.');
 }
 
 const ASSISTANT_SYSTEM = `تو دستیار ارشد APK AI Studio هستی: مهندس اندروید، تحلیل‌گر امنیت و مشاور بهینه‌سازی اپ.
 همیشه فارسی، کوتاه، عملی و دقیق جواب بده.
 
-قوانین اجباری در هر پاسخ مرتبط با برنامه:
-1) اگر خطای امنیتی یا باگ در بافت APK هست، صریح بگو (مثلاً Cleartext، debuggable، allowBackup، مجوز خطرناک، کامپوننت export‌شده).
-2) حداقل ۲ پیشنهاد مشخص برای بهتر شدن بده (امنیت، حریم خصوصی، سازگاری SDK، حذف تبلیغات).
-3) اگر کاربر خواست اصلاح/بیلد، مراحل دقیق بگو: «اصلاح کن» → «بیلد کن» → ذخیره در Downloads → نصب.
-4) اگر اطلاعات کافی نیست، بگو چه چیزی کم است.
-5) از کلی‌گویی و مدل‌های دیگر نام نبر؛ فقط روی همین APK تمرکز کن.
-
-فرمت پیشنهادی وقتی تحلیل می‌کنی:
-❌ خطاها:
-⚠️ هشدارها:
-✨ پیشنهادها:
-👉 قدم بعدی:`;
+قوانین اجباری:
+1) اگر خطای امنیتی یا باگ در بافت APK هست، صریح بگو.
+2) حداقل ۲ پیشنهاد مشخص بده.
+3) اگر کاربر خواست اصلاح/بیلد، مراحل دقیق بگو.
+4) از ادعای انجام کاری که روی فایل اعمال نشده خودداری کن.
+5) فقط روی همین APK تمرکز کن.`;
 
 export async function geminiChat(
   messages: Array<{ role: string; content: string }>,
@@ -319,4 +493,5 @@ export async function geminiAnalyze(type: string, context: unknown, prompt?: str
   return data.text || 'پاسخی دریافت نشد.';
 }
 
-export { LATEST_MODEL };
+/** @deprecated use resolveBestGeminiModel — kept for imports */
+export const LATEST_MODEL = 'gemini-flash-latest';
