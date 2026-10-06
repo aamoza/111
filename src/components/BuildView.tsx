@@ -38,6 +38,8 @@ export const BuildView: React.FC<BuildViewProps> = ({
     fileName: string;
     signedSha256: string;
     nativeSigned: boolean;
+    appliedManifest?: boolean;
+    adHits?: number;
   } | null>(null);
   const [buildError, setBuildError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -45,6 +47,13 @@ export const BuildView: React.FC<BuildViewProps> = ({
 
   const [alias, setAlias] = useState('apkaistudio-release');
   const [org, setOrg] = useState('APK AI Studio Authorized');
+
+  const pendingChanges = (project.changes || []).filter((c) => c.status === 'applied');
+  const hasStagedManifest = pendingChanges.some(
+    (c) =>
+      c.filePath === 'AndroidManifest.xml' ||
+      /manifest|منیفست|پچ امن|اصلاح|تبلیغ|نسخه|پکیج|label|مجوز/i.test(c.descriptionFa || '')
+  );
 
   const handleStartBuild = async () => {
     setIsBuilding(true);
@@ -65,7 +74,12 @@ export const BuildView: React.FC<BuildViewProps> = ({
         commonName: project.name,
       };
 
-      setProgress({ percent: 10, text: 'کپی باینری APK اصلی (بدون دستکاری منیفست)...' });
+      setProgress({
+        percent: 10,
+        text: hasStagedManifest
+          ? 'اعمال تغییرات چت روی منیفست (Binary AXML)...'
+          : 'کپی باینری APK اصلی...',
+      });
       const result = await buildAndSignApk(
         project,
         zip,
@@ -97,9 +111,16 @@ export const BuildView: React.FC<BuildViewProps> = ({
         fileName: signed.fileName,
         signedSha256,
         nativeSigned: true,
+        appliedManifest: result.appliedManifest,
+        adHits: result.adHits,
       });
       setProgress({ percent: 100, text: 'تمام — قابل نصب' });
-      onAddLog('build', `APK با Google apksig امضا شد: ${signed.fileName}`);
+      onAddLog(
+        'build',
+        `APK امضا شد: ${signed.fileName}` +
+          (result.appliedManifest ? ' · منیفست باینری اعمال شد' : '') +
+          (result.adHits ? ` · ${result.adHits} host تبلیغ خنثی` : '')
+      );
     } catch (err: unknown) {
       console.error(err);
       const msg = err instanceof Error ? err.message : 'خطای نامشخص';
@@ -131,8 +152,8 @@ export const BuildView: React.FC<BuildViewProps> = ({
       <div>
         <h1 className="text-xl font-bold text-white tracking-tight">ساخت APK قابل نصب</h1>
         <p className="text-xs text-slate-400 mt-1">
-          مثل ابزارهای قابل‌اعتماد: کپی باینری اصلی + حذف امضای قدیمی + امضای Google apksig. منیفست باینری
-          دست‌کاری نمی‌شود (تا خطای «تجزیه بسته» ندهد).
+          تغییرات چت/امنیت روی منیفست به‌صورت Binary AXML داخل APK نوشته می‌شوند؛ بعد META-INF پاک و با
+          Google apksig امضا می‌شود.
         </p>
       </div>
 
@@ -144,20 +165,31 @@ export const BuildView: React.FC<BuildViewProps> = ({
         </div>
       )}
 
+      {hasStagedManifest && (
+        <div className="p-4 rounded-2xl border border-sky-500/40 bg-sky-950/30 text-sky-100 text-xs leading-relaxed">
+          <CheckCircle2 className="w-4 h-4 inline-block ml-1 text-sky-400" />
+          {pendingChanges.length} تغییر ثبت‌شده آماده بیلد است — با زدن «ساخت» داخل APK اعمال می‌شوند.
+        </div>
+      )}
+
       <div className="p-4 rounded-2xl border border-slate-800 bg-slate-900/40">
         <span className="text-xs text-slate-400 block mb-2 font-semibold">مراحل واقعی:</span>
         <div className="flex items-center justify-between gap-2 overflow-x-auto text-xs font-mono py-1">
-          {['۱. کپی باینری', '۲. حذف META-INF', '۳. apksig', '۴. Downloads', '۵. حذف نسخه قبلی + نصب'].map(
-            (step, idx) => (
-              <div
-                key={idx}
-                className="flex items-center gap-2 p-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 shrink-0"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span>{step}</span>
-              </div>
-            )
-          )}
+          {[
+            '۱. کپی باینری',
+            '۲. منیفست AXML',
+            '۳. حذف META-INF',
+            '۴. apksig',
+            '۵. حذف نسخه قبلی + نصب',
+          ].map((step, idx) => (
+            <div
+              key={idx}
+              className="flex items-center gap-2 p-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 shrink-0"
+            >
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{step}</span>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -287,12 +319,18 @@ export const BuildView: React.FC<BuildViewProps> = ({
               <span className="text-slate-400">حجم:</span>
               <span>{(builtApk.blob.size / (1024 * 1024)).toFixed(2)} MB</span>
             </div>
+            {builtApk.appliedManifest && (
+              <div className="flex items-center justify-between text-slate-300">
+                <span className="text-slate-400">منیفست:</span>
+                <span className="text-sky-300">Binary AXML اعمال شد</span>
+              </div>
+            )}
           </div>
 
           <p className="text-[11px] text-emerald-200/90 leading-relaxed">
             ۱) ذخیره در Downloads
             <br />
-            ۲) نسخه قبلی همین پکیج را از گوشی حذف کن
+            ۲) نسخه قبلی همین پکیج را از گوشی حذف کن (امضا فرق دارد)
             <br />
             ۳) فایل جدید را نصب کن
           </p>
